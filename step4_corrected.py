@@ -1,557 +1,563 @@
+
 # -*- coding: utf-8 -*-
+from __future__ import annotations
+
 """
-Step 4 – Fully mutual groups placement (ΠΛΗΡΩΣ ΔΙΟΡΘΩΜΕΝΗ ΕΚΔΟΣΗ)
-Αλλαγές: 
-- ΜΟΝΟ δυάδες (όχι τριάδες) σύμφωνα με έγγραφο
-- gender_diff_max=3 (αυστηρότερο όριο)  
-- Αποκλεισμός "σπασμένων φιλιών" από προηγούμενα βήματα
-- Πλήρης κατηγοριοποίηση με "Μικτής Γνώσης" για μονόφυλες ομάδες
-- ΠΡΑΓΜΑΤΙΚΗ στρατηγική εναλλαγής κατηγοριών
-- ideal_per_class διανομή λαμβάνοντας υπόψη ήδη τοποθετημένες ομάδες
-- Export σε ΒΗΜΑ4_ΣΕΝΑΡΙΟ_1..5 στήλες
+step4_multi_groups_v2.py
+========================
+Βελτιωμένη εκδοχή του Βήματος 4 για Κ>2 τμήματα, με:
+- @dataclass config (Step4Config)
+- Input validation & custom exceptions
+- Δημιουργία δυάδων πλήρως αμοιβαίων, αποκλεισμός "σπασμένων"
+- Incremental metrics (χωρίς συνεχές recompute)
+- Heuristics τοποθέτησης με weighted class scoring (variance / cap / balance)
+- Early bounds pruning
+- Penalty & summary export με metadata
+- "FILLED" εξαγωγή (μεταφορά αναθέσεων Βημάτων 1–3 μέσα στο Βήμα 4)
+- One‑shot export σε μορφή PER_SCENARIO_EXACT (12 στήλες), όπως το παράδειγμα
+
+Συμβατότητα πεδίων:
+- ΦΥΛΟ: "ΑΓΟΡΙ"/"ΚΟΡΙΤΣΙ" (tolerant normalization)
+- ΚΑΛΗ_ΓΝΩΣΗ_ΕΛΛΗΝΙΚΩΝ: "Ν" / "Ο"
+- ΦΙΛΟΙ (ή ΦΙΛΟΣ): λίστα φιλίας (comma/semicolon/pipe/newline separated)
+- ΣΠΑΣΜΕΝΕΣ_ΦΙΛΙΕΣ: bool (optional, default False)
+- ΒΗΜΑ1/2/3_ΣΕΝΑΡΙΟ_k: προγενέστερες αναθέσεις
+
+API (κύρια):
+    run_step4_multi_with_fill_v2(df, config=Step4Config()) -> DataFrame
+    export_step4_nextcol_full_multi_filled_v2(step3_xlsx, out_xlsx, config=Step4Config()) -> str
+    export_step3_to_per_scenario_exact_filled_v2(step3_xlsx, out_xlsx, config=Step4Config()) -> str
 """
 
-import itertools
-from collections import defaultdict
-from copy import deepcopy
-import pandas as pd
-import math
-from typing import List, Dict, Tuple, Optional, Set
+from dataclasses import dataclass
+from typing import Dict, List, Tuple, Optional, Any
+import pandas as pd, numpy as np, re, math, random, statistics
+from datetime import datetime
 
-def _auto_num_classes(df: pd.DataFrame, override: Optional[int] = None) -> int:
-    """Αυτόματος υπολογισμός αριθμού τμημάτων βάσει αριθμού μαθητών."""
-    n = len(df)
-    k = max(2, math.ceil(n/25))
-    return int(k if override is None else override)
+# ------------------------- Exceptions -------------------------
 
-# -------------------- Utilities --------------------
+class Step4Error(Exception): pass
+class InsufficientDataError(Step4Error): pass
+class InvalidConfigError(Step4Error): pass
 
-def is_fully_mutual(group: List[str], df: pd.DataFrame) -> bool:
-    """Επιστρέφει True αν κάθε ζεύγος στη 'group' είναι αμοιβαίοι φίλοι."""
-    if len(group) < 2:
-        return False
-        
-    for name in group:
-        try:
-            friends = set(df.loc[df['ΟΝΟΜΑ'] == name, 'ΦΙΛΟΙ'].values[0])
-        except (IndexError, KeyError):
-            return False
-        
-        for other in group:
-            if other == name:
+# ------------------------- Config & constants -----------------
+
+@dataclass
+class Step4Config:
+    max_pop_diff: int = 4
+    max_greek_diff: int = 6
+    max_gender_diff: int = 6
+    cap_per_class: int = 25
+    max_scenarios: int = 5
+    # weights for heuristic class scoring (lower is better)
+    w_pop_variance: float = 1.0
+    w_greek_variance: float = 0.6
+    w_gender_variance: float = 0.6
+    w_cap_overflow: float = 100.0   # hard discourage breaking cap
+    random_seed: int = 42
+    # NEW: ideal strategy flags
+    use_ideal_strategy: bool = True
+    prefer_opposites: bool = True
+
+STEP_COLUMN_PATTERNS = re.compile(r"^ΒΗΜΑ[1-3]_ΣΕΝΑΡΙΟ_\d+$")
+FRIEND_COLUMN_CANDIDATES = ("ΦΙΛΟΙ","ΦΙΛΟΣ")
+NAME_COLUMN_CANDIDATES = ("ΟΝΟΜΑ","ΟΝΟΜΑΤΕΠΩΝΥΜΟ","Ονοματεπώνυμο","ΜΑΘΗΤΗΣ","ΜΑΘΗΤΡΙΑ","Name","FULL_NAME")
+
+random.seed(42)
+
+# ------------------------- Normalization utils ----------------
+
+def _norm_str(x: Any) -> str:
+    if pd.isna(x): return ""
+    s = str(x).strip().lower()
+    return re.sub(r"\s+", " ", s)
+
+def _gender_norm(x: Any) -> str:
+    if pd.isna(x):
+        return ""
+    s = str(x).strip().lower()
+    if s in ("αγορι","boy","male","α","m"):
+        return "ΑΓΟΡΙ"
+    if s in ("κοριτσι","girl","female","κ","f"):
+        return "ΚΟΡΙΤΣΙ"
+    # unknown -> empty to avoid spurious categories
+    return ""
+def _greek_norm(x: Any) -> str:
+    if pd.isna(x):
+        return ""
+    t = str(x).strip().upper()
+    if t in ("Ν","NAI","YES","GOOD","KALH","KALΗ"):
+        return "Ν"
+    if t in ("Ο","OXI","ΟΧΙ","NO","NOT","OK"):
+        return "Ο"
+    # unknown -> empty
+    return ""
+def _friends_list(x: Any) -> List[str]:
+    if pd.isna(x): return []
+    parts = re.split(r"[;,|/\n]+", str(x))
+    return [p.strip() for p in parts if p.strip()]
+
+# ------------------------- Column detection -------------------
+
+def _find_step_cols(df: pd.DataFrame) -> List[str]:
+    cols = [c for c in df.columns if STEP_COLUMN_PATTERNS.match(str(c))]
+    if not cols:
+        cols = [c for c in df.columns if str(c).startswith("ΒΗΜΑ1_") or str(c).startswith("ΒΗΜΑ2_") or str(c).startswith("ΒΗΜΑ3_")]
+    return cols
+
+def _detect_classes(df: pd.DataFrame) -> List[str]:
+    step_cols = _find_step_cols(df)
+    classes = []
+    for c in step_cols:
+        vals = df[c].dropna().astype(str).unique().tolist()
+        classes.extend(vals)
+    classes = [v for v in classes if str(v).strip() != ""]
+    classes = sorted(set(classes), key=lambda x: (len(str(x)), str(x)))
+    return classes
+
+def _get_current_assignment_row(row: pd.Series, step_cols: List[str]) -> Optional[str]:
+    def key_order(c):
+        if str(c).startswith("ΒΗΜΑ3_"): return 0
+        if str(c).startswith("ΒΗΜΑ2_"): return 1
+        if str(c).startswith("ΒΗΜΑ1_"): return 2
+        return 3
+    for c in sorted(step_cols, key=key_order):
+        v = row.get(c, np.nan)
+        if pd.notna(v) and str(v).strip() != "":
+            return str(v).strip()
+    return None
+
+# ------------------------- Input validation -------------------
+
+def _require_columns(df: pd.DataFrame) -> None:
+    # At minimum: ΦΥΛΟ, ΚΑΛΗ_ΓΝΩΣΗ_ΕΛΛΗΝΙΚΩΝ, ΦΙΛΟΙ/ΦΙΛΟΣ, step 1..3
+    missing_steps = not any(str(c).startswith("ΒΗΜΑ") for c in df.columns)
+    if missing_steps:
+        raise InsufficientDataError("Λείπουν στήλες ΒΗΜΑ1/2/3 για να οριστούν οι μη-τοποθετημένοι.")
+    if "ΦΥΛΟ" not in df.columns:
+        raise InsufficientDataError("Λείπει η στήλη ΦΥΛΟ.")
+    if "ΚΑΛΗ_ΓΝΩΣΗ_ΕΛΛΗΝΙΚΩΝ" not in df.columns:
+        raise InsufficientDataError("Λείπει η στήλη ΚΑΛΗ_ΓΝΩΣΗ_ΕΛΛΗΝΙΚΩΝ.")
+    if not any(c in df.columns for c in FRIEND_COLUMN_CANDIDATES):
+        raise InsufficientDataError("Λείπει στήλη ΦΙΛΟΙ ή ΦΙΛΟΣ.")
+
+def _choose_name_col(df: pd.DataFrame) -> str:
+    for cand in NAME_COLUMN_CANDIDATES:
+        if cand in df.columns:
+            return cand
+    # fallback: first object col that isn't a step/friends
+    for c in df.columns:
+        if df[c].dtype == object and not str(c).startswith("ΒΗΜΑ") and c not in FRIEND_COLUMN_CANDIDATES:
+            return c
+    return NAME_COLUMN_CANDIDATES[0] if NAME_COLUMN_CANDIDATES[0] in df.columns else df.columns[0]
+
+# ------------------------- Grouping / dyads -------------------
+
+def build_unplaced_and_mutual_dyads(df: pd.DataFrame,
+                                    broken_col="ΣΠΑΣΜΕΝΕΣ_ΦΙΛΙΕΣ") -> Tuple[pd.DataFrame, List[Tuple[int,int]]]:
+    step_cols = _find_step_cols(df)
+    mask_unplaced = pd.Series(True, index=df.index)
+    for c in step_cols:
+        mask_unplaced &= df[c].isna()
+    unplaced_df = df[mask_unplaced].copy()
+
+    name_col = _choose_name_col(df)
+    friends_col = "ΦΙΛΟΙ" if "ΦΙΛΟΙ" in df.columns else ("ΦΙΛΟΣ" if "ΦΙΛΟΣ" in df.columns else None)
+    if friends_col is None:
+        raise InsufficientDataError("Δεν βρέθηκε στήλη ΦΙΛΟΙ/ΦΙΛΟΣ.")
+
+    names = unplaced_df[name_col].astype(str).fillna("").map(str.strip)
+    names_norm = names.map(_norm_str)
+
+    # Map normalized name -> index (unique)
+    index_by_norm = {}
+    for idx, nm in zip(unplaced_df.index.tolist(), names_norm.tolist()):
+        if nm and nm not in index_by_norm:
+            index_by_norm[nm] = idx
+
+    # Precompute normalized friend sets per index
+    raw_lists = unplaced_df[friends_col].tolist()
+    friend_sets = {}
+    for idx, raw in zip(unplaced_df.index.tolist(), raw_lists):
+        lst = [_norm_str(f) for f in _friends_list(raw)]
+        friend_sets[idx] = set([f for f in lst if f])
+
+    broken_mask = unplaced_df[broken_col] if (broken_col in unplaced_df.columns) else pd.Series(False, index=unplaced_df.index)
+
+    dyads_set = set()
+    pos_indices = unplaced_df.index.tolist()
+    for i_pos, idx_i in enumerate(pos_indices):
+        if bool(broken_mask.loc[idx_i]):
+            continue
+        me_norm = names_norm.iloc[i_pos]
+        if not me_norm:
+            continue
+        for f_norm in friend_sets[idx_i]:
+            j_idx = index_by_norm.get(f_norm)
+            if j_idx is None or j_idx == idx_i:
                 continue
-            if other not in friends:
-                return False
-    
-    # Έλεγχος συμμετρίας
-    for a, b in itertools.permutations(group, 2):
-        try:
-            fa = set(df.loc[df['ΟΝΟΜΑ'] == a, 'ΦΙΛΟΙ'].values[0])
-            if b not in fa:
-                return False
-        except (IndexError, KeyError):
-            return False
+            if bool(broken_mask.loc[j_idx]):
+                continue
+            # check mutual via normalized names
+            if me_norm in friend_sets[j_idx]:
+                pair = tuple(sorted([idx_i, j_idx]))
+                dyads_set.add(pair)
+
+    dyads = sorted(list(dyads_set))
+    return unplaced_df, dyads
+
+def group_category(rows: List[pd.Series]) -> Dict[str,str]:
+    genders = {_gender_norm(r.get("ΦΥΛΟ","")) for r in rows}
+    greeks = {_greek_norm(r.get("ΚΑΛΗ_ΓΝΩΣΗ_ΕΛΛΗΝΙΚΩΝ","")) for r in rows}
+    gender_cat = "ΑΓΟΡΙΑ" if genders == {"ΑΓΟΡΙ"} else ("ΚΟΡΙΤΣΙΑ" if genders == {"ΚΟΡΙΤΣΙ"} else "ΜΙΚΤΟ ΦΥΛΟ")
+    greek_cat  = "ΚΑΛΗ" if greeks == {"Ν"} else ("ΟΧΙ ΚΑΛΗ" if greeks == {"Ο"} else "ΜΙΚΤΗ")
+    return {"gender_cat": gender_cat, "greek_cat": greek_cat}
+
+# ------------------------- Metrics / penalty ------------------
+
+def empty_metrics(classes: List[str]) -> Dict[str,Dict[str,int]]:
+    return {c: {"total":0, "boys":0, "girls":0, "greek_good":0} for c in classes}
+
+def apply_student_to_metrics(df: pd.DataFrame, idx: int, cl: str, metrics: Dict[str,Dict[str,int]]) -> None:
+    # metrics must be pre-initialized for all classes
+    row = df.loc[idx]
+    m = metrics[cl]
+    m["total"] += 1
+    g = _gender_norm(row.get("ΦΥΛΟ",""))
+    if g == "ΑΓΟΡΙ":
+        m["boys"] += 1
+    elif g == "ΚΟΡΙΤΣΙ":
+        m["girls"] += 1
+    if _greek_norm(row.get("ΚΑΛΗ_ΓΝΩΣΗ_ΕΛΛΗΝΙΚΩΝ","")) == "Ν":
+        m["greek_good"] += 1
+
+def metrics_diff_tuple(mets: Dict[str,Dict[str,int]]) -> Tuple[int,int,int,int]:
+    totals = [m["total"] for m in mets.values()] or [0]
+    goods  = [m["greek_good"] for m in mets.values()] or [0]
+    boys   = [m["boys"] for m in mets.values()] or [0]
+    girls  = [m["girls"] for m in mets.values()] or [0]
+    return (max(totals)-min(totals), max(boys)-min(boys), max(girls)-min(girls), max(goods)-min(goods))
+
+def ranges_ok(mets: Dict[str,Dict[str,int]], cfg: Step4Config) -> bool:
+    d_pop, d_boys, d_girls, d_good = metrics_diff_tuple(mets)
+    if d_pop > cfg.max_pop_diff: return False
+    if d_good > cfg.max_greek_diff: return False
+    if d_boys > cfg.max_gender_diff: return False
+    if d_girls > cfg.max_gender_diff: return False
     return True
 
-def has_broken_friendship(name: str, df: pd.DataFrame) -> bool:
-    """
-    Έλεγχος αν μαθητής έχει σπασμένες φιλίες από προηγούμενα βήματα.
-    Υποθέτει ότι υπάρχει στήλη 'ΣΠΑΣΜΕΝΕΣ_ΦΙΛΙΕΣ' (True/False).
-    """
-    if 'ΣΠΑΣΜΕΝΕΣ_ΦΙΛΙΕΣ' not in df.columns:
-        return False
-    
-    try:
-        return bool(df.loc[df['ΟΝΟΜΑ'] == name, 'ΣΠΑΣΜΕΝΕΣ_ΦΙΛΙΕΣ'].values[0])
-    except (IndexError, KeyError):
-        return False
+def penalty_score(mets: Dict[str,Dict[str,int]]) -> int:
+    d_pop, d_boys, d_girls, d_good = metrics_diff_tuple(mets)
+    pop_pen = max(0, d_pop - 1)
+    grk_pen = max(0, d_good - 2)
+    sex_pen = max(0, d_boys - 1) + max(0, d_girls - 1)
+    return int(pop_pen + grk_pen + sex_pen)
 
-def create_fully_mutual_groups(df: pd.DataFrame, assigned_column: str) -> List[List[str]]:
-    """
-    Δημιουργία ΜΟΝΟ ΔΥΑΔΩΝ (όχι τριάδων) μεταξύ μη-τοποθετημένων μαθητών.
-    Αποκλεισμός μαθητών με σπασμένες φιλίες από προηγούμενα βήματα.
-    """
-    unassigned = df[df[assigned_column].isna()].copy()
-    
-    # Φιλτράρισμα μαθητών χωρίς φίλους
-    unassigned = unassigned[
-        unassigned['ΦΙΛΟΙ'].map(lambda x: isinstance(x, list) and len(x) > 0)
-    ]
-    
-    if len(unassigned) == 0:
-        return []
-    
-    names = list(unassigned['ΟΝΟΜΑ'].astype(str).unique())
-    
-    # Αποκλεισμός μαθητών με σπασμένες φιλίες
-    names_no_broken = [name for name in names if not has_broken_friendship(name, df)]
-    
-    # Επιπλέον φιλτράρισμα: αποκλεισμός μαθητών χωρίς αμοιβαίες φιλίες στο pool
-    names_with_mutual = []
-    for name in names_no_broken:
-        try:
-            friends = set(df.loc[df['ΟΝΟΜΑ'] == name, 'ΦΙΛΟΙ'].values[0])
-            mutual_friends_in_pool = friends.intersection(set(names_no_broken))
-            if len(mutual_friends_in_pool) > 0:
-                names_with_mutual.append(name)
-        except (IndexError, KeyError):
+def variance_score(mets: Dict[str,Dict[str,int]]) -> Tuple[float,float,float]:
+    vals = list(mets.values())
+    if not vals:
+        return (0.0, 0.0, 0.0)
+    totals = [max(0, int(m.get("total", 0))) for m in vals]
+    boys   = [max(0, int(m.get("boys", 0)))  for m in vals]
+    girls  = [max(0, int(m.get("girls", 0))) for m in vals]
+    goods  = [max(0, int(m.get("greek_good", 0))) for m in vals]
+    v_tot = statistics.pvariance(totals) if len(totals) > 1 else 0.0
+    v_gen = statistics.pvariance([b - g for b,g in zip(boys, girls)]) if len(boys) > 1 else 0.0
+    v_grk = statistics.pvariance(goods) if len(goods) > 1 else 0.0
+    return (v_tot, v_gen, v_grk)
+
+# ------------------------- Core algorithm ---------------------
+
+def _base_assignment_series(df: pd.DataFrame) -> pd.Series:
+    step_cols = _find_step_cols(df)
+    base = pd.Series(index=df.index, dtype=object)
+    for ridx, row in df.iterrows():
+        val = _get_current_assignment_row(row, step_cols)
+        if val is not None:
+            base.loc[ridx] = val
+    return base
+
+def _classes_from_base(base: pd.Series) -> List[str]:
+    classes = sorted(set(str(v) for v in base.dropna().unique().tolist()))
+    return [c for c in classes if c.strip() != ""]
+
+def _init_metrics_from_base(df: pd.DataFrame, base: pd.Series, classes: List[str]) -> Dict[str,Dict[str,int]]:
+    mets = empty_metrics(classes)
+    class_set = set(classes)
+    for idx, cl in base.items():
+        if pd.isna(cl):
             continue
-    
-    names = names_with_mutual
-    used = set()
-    groups = []
-
-    # ΜΟΝΟ ΔΥΑΔΕΣ (σύμφωνα με έγγραφο - όχι τριάδες)
-    for g in itertools.combinations(names, 2):
-        if set(g) & used:
+        cl = str(cl)
+        if cl not in class_set:
             continue
-        if is_fully_mutual(list(g), df):
-            groups.append(list(g))
-            used |= set(g)
+        apply_student_to_metrics(df, idx, cl, mets)
+    return mets
 
-    return groups
+def _dyad_catalog(df: pd.DataFrame, dyads: List[Tuple[int,int]]) -> List[Dict[str,Any]]:
+    info = []
+    cat_counts = {}
+    for (i,j) in dyads:
+        rows = [df.loc[i], df.loc[j]]
+        cat = group_category(rows)
+        key = (cat["gender_cat"], cat["greek_cat"])
+        cat_counts[key] = cat_counts.get(key, 0) + 1
+        info.append({"pair": (i,j), "size": 2, "cat": cat, "key": key})
+    # scarcity = 1 / count; rare categories first
+    for item in info:
+        cnt = cat_counts[item["key"]]
+        item["scarcity"] = 1.0 / cnt
+    # sort dyads: rare categories first (desc scarcity), then by index
+    info.sort(key=lambda x: (-x["scarcity"], x["pair"]))
+    return info
 
-def get_group_characteristics(group: List[str], df: pd.DataFrame) -> str:
-    """
-    Κατηγοριοποίηση ομάδας βάσει φύλου και γνώσης ελληνικών.
-    ΔΙΟΡΘΩΜΕΝΗ ΕΚΔΟΣΗ: Πλήρης διαχείριση όλων των κατηγοριών.
-    """
-    sub = df[df['ΟΝΟΜΑ'].isin(group)]
-    genders = set(sub['ΦΥΛΟ'])
-    lang = set(sub['ΚΑΛΗ_ΓΝΩΣΗ_ΕΛΛΗΝΙΚΩΝ'])
-    
-    # Μικτό φύλο ως ενιαία κατηγορία (αγνοεί Ν/Ο)
-    if len(genders) > 1:
-        return 'Ομάδες Μικτού Φύλου'
-    
-    # Μονό φύλο - συνδυασμός φύλου και γνώσης
-    gtxt = 'Αγόρια' if 'Α' in genders else 'Κορίτσια'
-    
-    # ΔΙΟΡΘΩΣΗ: Πλήρης διαχείριση Μικτής Γνώσης
-    if len(lang) == 1:
-        ltxt = 'Καλή Γνώση' if 'Ν' in lang else 'Όχι Καλή Γνώση'
-    else:
-        ltxt = 'Μικτής Γνώσης'  # ΠΡΟΣΘΗΚΗ: Μικτής Γνώσης για μονόφυλες ομάδες
-    
-    return f'{ltxt} ({gtxt})'
+def _class_weighted_score(mets: Dict[str,Dict[str,int]], cfg: Step4Config) -> float:
+    v_tot, v_gen, v_grk = variance_score(mets)
+    return cfg.w_pop_variance*v_tot + cfg.w_gender_variance*v_gen + cfg.w_greek_variance*v_grk
 
-def categorize_groups(groups: List[List[str]], df: pd.DataFrame) -> Dict[str, List[List[str]]]:
-    """Ομαδοποίηση των ομάδων βάσει χαρακτηριστικών."""
-    cat = defaultdict(list)
-    for g in groups:
-        cat[get_group_characteristics(g, df)].append(g)
-    return cat
+def _place_pair(df: pd.DataFrame, pair: Tuple[int,int], cl: str, mets: Dict[str,Dict[str,int]]) -> None:
+    apply_student_to_metrics(df, pair[0], cl, mets)
+    apply_student_to_metrics(df, pair[1], cl, mets)
 
-def get_opposite_category(category: str) -> str:
-    """
-    ΔΙΟΡΘΩΜΕΝΗ στρατηγική εναλλαγής - αντίθετη κατηγορία για ισορροπία.
-    """
-    opposites = {
-        'Καλή Γνώση (Αγόρια)': 'Όχι Καλή Γνώση (Κορίτσια)',
-        'Όχι Καλή Γνώση (Κορίτσια)': 'Καλή Γνώση (Αγόρια)',
-        'Καλή Γνώση (Κορίτσια)': 'Όχι Καλή Γνώση (Αγόρια)',
-        'Όχι Καλή Γνώση (Αγόρια)': 'Καλή Γνώση (Κορίτσια)',
-        'Μικτής Γνώσης (Αγόρια)': 'Μικτής Γνώσης (Κορίτσια)',
-        'Μικτής Γνώσης (Κορίτσια)': 'Μικτής Γνώσης (Αγόρια)',
-        # Μικτό Φύλο δεν έχει αντίθετο - επιστρέφει None
-        'Ομάδες Μικτού Φύλου': None,
-    }
-    return opposites.get(category, category)
+def _would_break_cap(mets: Dict[str,Dict[str,int]], cl: str, size: int, cfg: Step4Config) -> bool:
+    return (mets.get(cl, {"total":0})["total"] + size) > cfg.cap_per_class
 
-def count_groups_by_category_per_class_strict(df: pd.DataFrame, assigned_column: str, classes: List[str], 
-                                             step1_results: None,
-                                             detected_pairs: Optional[List[Tuple[str, str]]] = None) -> Dict[str, Dict[str, int]]:
-    """
-    ΒΕΛΤΙΩΜΕΝΗ καταμέτρηση ομάδων που λαμβάνει υπόψη την ΠΡΑΓΜΑΤΙΚΗ δομή από τα προηγούμενα βήματα.
-    
-    Args:
-        step1_results: Step1Results object από step1_immutable.py (για παιδιά εκπαιδευτικών)
-        detected_pairs: List από (name1, name2) pairs που εντοπίστηκαν σε προηγούμενα βήματα
-    """
-    assigned = df[~df[assigned_column].isna()]
-    groups_per_class = defaultdict(lambda: defaultdict(int))
-    
-    # ΒΗΜΑ 1: Καταμέτρηση παιδιών εκπαιδευτικών ως ατομικές "ομάδες"
-    if step1_results is not None:
-        # Για κάθε σενάριο του Βήματος 1
-        for scenario in step1_results.scenarios:
-            if scenario.column_name == assigned_column:
-                # Αυτά τα παιδιά τοποθετήθηκαν ως individuals στο Βήμα 1
-                for student_name, class_name in scenario.assignments.items():
-                    if class_name in classes:
-                        fake_group = [student_name]
-                        category = get_group_characteristics(fake_group, df)
-                        groups_per_class[class_name][category] += 1
+def generate_scenarios_for_dyads_v2(df: pd.DataFrame,
+                                    dyads: List[Tuple[int,int]],
+                                    base_assign: pd.Series,
+                                    classes: List[str],
+                                    cfg: Step4Config) -> List[Dict[str,Any]]:
+    """Backtracking με incremental metrics, scarcity ordering & weighted class scoring."""
+    base_metrics = _init_metrics_from_base(df, base_assign, classes)
+    dyad_info = _dyad_catalog(df, dyads)
+
+    solutions: List[Dict[str,Any]] = []
+    new_assign: Dict[int,str] = {}
+    mets = {c: m.copy() for c,m in base_metrics.items()}  # working metrics
+
+    def backtrack(idx: int):
+        if len(solutions) >= cfg.max_scenarios:
+            return
+        if idx >= len(dyad_info):
+            # accept if ranges ok
+            if not ranges_ok(mets, cfg): return
+            pen = penalty_score(mets)
+            assign_ser = pd.Series(index=df.index, dtype=object)
+            for sid, cl in new_assign.items():
+                assign_ser.loc[sid] = cl
+            solutions.append({"assign": assign_ser, "metrics": {c: m.copy() for c,m in mets.items()}, "penalty": pen})
+            return
+
+        item = dyad_info[idx]
+        pair, size = item["pair"], item["size"]
+
+        # order classes by lowest projected weighted score
+        class_scores: List[Tuple[float,str]] = []
+        for cl in classes:
+            if _would_break_cap(mets, cl, size, cfg):
+                continue
+            # simulate
+            _place_pair(df, pair, cl, mets)
+            ok_now = ranges_ok(mets, cfg)  # early pruning (tight bound)
+            score = _class_weighted_score(mets, cfg) + (1000.0 if not ok_now else 0.0)
+            # undo
+            # We need to revert metrics: subtract pair
+            # Create a cheap revert by manual subtraction
+            for sid in pair:
+                row = df.loc[sid]
+                m = mets[cl]
+                m["total"] -= 1
+                g = _gender_norm(row.get("ΦΥΛΟ",""))
+                if g == "ΑΓΟΡΙ": m["boys"] -= 1
+                elif g == "ΚΟΡΙΤΣΙ": m["girls"] -= 1
+                if _greek_norm(row.get("ΚΑΛΗ_ΓΝΩΣΗ_ΕΛΛΗΝΙΚΩΝ","")) == "Ν": m["greek_good"] -= 1
+            class_scores.append((score, cl))
+
+        class_scores.sort(key=lambda t: t[0])
+
+        for _, cl in class_scores:
+            if len(solutions) >= cfg.max_scenarios:
                 break
-    
-    # ΒΗΜΑ 2 & 3: Εντοπισμός πραγματικών ζευγαριών που διατηρήθηκαν
-    processed_students = set()
-    
-    if detected_pairs:
-        for name1, name2 in detected_pairs:
-            if name1 in processed_students or name2 in processed_students:
+            # apply
+            for sid in pair: new_assign[sid] = cl
+            _place_pair(df, pair, cl, mets)
+
+            # deeper
+            backtrack(idx+1)
+
+            # revert
+            for sid in pair: del new_assign[sid]
+            # subtract pair from mets
+            for sid in pair:
+                row = df.loc[sid]
+                m = mets[cl]
+                m["total"] -= 1
+                g = _gender_norm(row.get("ΦΥΛΟ",""))
+                if g == "ΑΓΟΡΙ": m["boys"] -= 1
+                elif g == "ΚΟΡΙΤΣΙ": m["girls"] -= 1
+                if _greek_norm(row.get("ΚΑΛΗ_ΓΝΩΣΗ_ΕΛΛΗΝΙΚΩΝ","")) == "Ν": m["greek_good"] -= 1
+
+    backtrack(0)
+
+    # sort & tie-breakers
+    def diffs_tuple(m):
+        d_pop, d_boys, d_girls, d_good = metrics_diff_tuple(m)
+        return (d_pop, d_boys, d_girls, d_good)
+    solutions.sort(key=lambda s: (s["penalty"],) + diffs_tuple(s["metrics"]))
+    return solutions[:cfg.max_scenarios]
+
+# ------------------------- Public APIs --------------------------------------
+
+def run_step4_multi_with_fill_v2(df: pd.DataFrame, config: Step4Config = Step4Config()) -> pd.DataFrame:
+    _require_columns(df)
+    base_assign = _base_assignment_series(df)
+    classes = _detect_classes(df)
+    if not classes:
+        # αν δεν βρεθούν από στήλες 1..3, πάρε από base
+        classes = _classes_from_base(base_assign)
+    if not classes:
+        raise InsufficientDataError("Δεν εντοπίστηκαν labels τμημάτων από τα Βήματα 1–3.")
+    if len(classes) < 2:
+        out = df.copy()
+        for k in range(1, config.max_scenarios+1):
+            out[f"ΒΗΜΑ4_ΣΕΝΑΡΙΟ_{k}"] = base_assign
+        out["Σύνοψη_ΒΗΜΑ4"] = "Μόνο 1 τμήμα — carry-forward από Βήματα 1–3."
+        return out
+    unplaced_df, dyads = build_unplaced_and_mutual_dyads(df)
+
+    out = df.copy()
+    if not dyads:
+        # carry-forward to ensure ΒΗΜΑ4 continuity
+        for k in range(1, config.max_scenarios+1):
+            out[f"ΒΗΜΑ4_ΣΕΝΑΡΙΟ_{k}"] = base_assign
+        out["Σύνοψη_ΒΗΜΑ4"] = "Δεν βρέθηκαν πλήρως αμοιβαίες δυάδες μεταξύ μη-τοποθετημένων."
+        return out
+
+    sols = generate_scenarios_for_dyads_v2(df, dyads, base_assign, classes, config)
+    if not sols:
+        out["Σύνοψη_ΒΗΜΑ4"] = "Δεν βρέθηκαν αποδεκτά σενάρια με βάση τα όρια."
+        return out
+
+    # Γράψε έως 5 σενάρια
+    for k,sol in enumerate(sols, start=1):
+        col = f"ΒΗΜΑ4_ΣΕΝΑΡΙΟ_{k}"
+        out[col] = np.nan
+        for idx, cl in sol["assign"].items():
+            if pd.notna(cl):
+                out.loc[idx, col] = cl
+
+    # FILLED: μεταφορά όλων των υπαρχουσών αναθέσεων (βάση)
+    for c in [c for c in out.columns if re.match(r"^ΒΗΜΑ4_ΣΕΝΑΡΙΟ_\d+$", str(c))]:
+        out[c] = out[c].where(out[c].notna(), base_assign)
+
+    # penalties snapshot στην πρώτη γραμμή (αν θες να επιλέγεις “best” αργότερα)
+    for k,sol in enumerate(sols, start=1):
+        out.loc[out.index[0], f"ΒΗΜΑ4_penalty_{k}"] = int(sol["penalty"])
+
+    # metadata
+    out.loc[out.index[0], "ΒΗΜΑ4_meta"] = f"generated:{datetime.now().isoformat(timespec='seconds')} cfg={config}"
+
+    return out
+
+def export_step4_nextcol_full_multi_filled_v2(step3_xlsx_path: str, out_xlsx_path: str, config: Step4Config = Step4Config()) -> str:
+    xls = pd.ExcelFile(step3_xlsx_path)
+    summary_rows = []
+    with pd.ExcelWriter(out_xlsx_path, engine="openpyxl") as writer:
+        for sh in xls.sheet_names:
+            df = xls.parse(sh)
+            if str(sh).strip().lower().startswith("σύνοψη"):
+                # αντιγράφουμε σύνοψη, για πληρότητα
+                df.to_excel(writer, index=False, sheet_name=str(sh)[:31])
                 continue
-            
-            # Έλεγχος αν το ζεύγος βρίσκεται στο ίδιο τμήμα
-            class1 = assigned[assigned['ΟΝΟΜΑ'] == name1][assigned_column]
-            class2 = assigned[assigned['ΟΝΟΜΑ'] == name2][assigned_column]
-            
-            if not class1.empty and not class2.empty and class1.iloc[0] == class2.iloc[0]:
-                class_name = str(class1.iloc[0])
-                if class_name in classes:
-                    # Αυτό είναι πραγματικό ζεύγος που διατηρήθηκε
-                    pair_group = [name1, name2]
-                    category = get_group_characteristics(pair_group, df)
-                    groups_per_class[class_name][category] += 1
-                    processed_students.update([name1, name2])
-    
-    # ΥΠΟΛΟΙΠΑ: Μεμονωμένοι μαθητές που δεν ανήκουν σε ζεύγη
-    for class_name in classes:
-        class_students = assigned[assigned[assigned_column] == class_name]
-        for _, student in class_students.iterrows():
-            student_name = str(student['ΟΝΟΜΑ']).strip()
-            if student_name not in processed_students:
-                # Αυτός ο μαθητής δεν ανήκει σε κανένα διατηρημένο ζεύγος
-                fake_group = [student_name]
-                category = get_group_characteristics(fake_group, df)
-                groups_per_class[class_name][category] += 1
-    
-    return dict(groups_per_class)
+            try:
+                out_df = run_step4_multi_with_fill_v2(df, config=config)
+                step4_cols = [c for c in out_df.columns if re.match(r"^ΒΗΜΑ4_ΣΕΝΑΡΙΟ_\d+$", str(c))]
+                placed_counts = [int(out_df[c].notna().sum()) for c in step4_cols] if step4_cols else []
+                summary_rows.append({
+                    "Φύλλο": sh, 
+                    "Σενάρια ΒΗΜΑ4": len(step4_cols),
+                    "Τοποθετημένοι (ανά σενάριο)": ", ".join(map(str, placed_counts)) if placed_counts else "(κανένας)"
+                })
+            except Exception as ex:
+                out_df = df.copy()
+                out_df["Σύνοψη_ΒΗΜΑ4"] = f"ERROR: {type(ex).__name__}: {ex}"
+                summary_rows.append({
+                    "Φύλλο": sh,
+                    "Σενάρια ΒΗΜΑ4": "ERROR",
+                    "Τοποθετημένοι (ανά σενάριο)": f"{type(ex).__name__}: {ex}"
+                })
+            out_df.to_excel(writer, index=False, sheet_name=str(sh)[:31])
+        # summary + metadata
+        meta = pd.DataFrame([{
+            "generated_at": datetime.now().isoformat(timespec="seconds"),
+            "config": repr(config)
+        }])
+        pd.DataFrame(summary_rows).to_excel(writer, index=False, sheet_name="Σύνοψη")
+        meta.to_excel(writer, index=False, sheet_name="Meta")
+    return out_xlsx_path
 
-def calculate_ideal_distribution(total_groups_per_category: Dict[str, int], classes: List[str]) -> Dict[str, int]:
-    """Υπολογισμός ιδανικού αριθμού ομάδων ανά τμήμα για κάθε κατηγορία."""
-    ideal = {}
-    num_classes = len(classes)
-    
-    for category, total_groups in total_groups_per_category.items():
-        ideal[category] = math.ceil(total_groups / num_classes)
-    
-    return ideal
+def _pick_best_step4_col(df: pd.DataFrame) -> Tuple[Optional[int], Optional[str]]:
+    pen_map = {}
+    for c in df.columns:
+        m = re.match(r"^ΒΗΜΑ4_penalty_(\d+)$", str(c))
+        if m:
+            k = int(m.group(1))
+            val = df[c].dropna()
+            if not val.empty:
+                try:
+                    pen_map[k] = float(val.iloc[0])
+                except: pass
+    step4_cols = [c for c in df.columns if re.match(r"^ΒΗΜΑ4_ΣΕΝΑΡΙΟ_\d+$", str(c))]
+    if not step4_cols:
+        return None, None
+    if pen_map:
+        best_k = min(pen_map, key=lambda k: pen_map[k])
+        best_col = f"ΒΗΜΑ4_ΣΕΝΑΡΙΟ_{best_k}"
+        return best_k, best_col
+    first_col = step4_cols[0]
+    k = int(re.search(r"\d+$", first_col).group(0))
+    return k, first_col
 
-# -------------------- Scoring & acceptance --------------------
+def export_step3_to_per_scenario_exact_filled_v2(step3_xlsx_path: str, out_xlsx_path: str, config: Step4Config = Step4Config()) -> str:
+    TARGET_BASE_COLS = ['Α/Α','ΟΝΟΜΑ','ΦΥΛΟ','ΖΩΗΡΟΣ','ΙΔΙΑΙΤΕΡΟΤΗΤΑ','ΠΑΙΔΙ_ΕΚΠΑΙΔΕΥΤΙΚΟΥ','ΚΑΛΗ_ΓΝΩΣΗ_ΕΛΛΗΝΙΚΩΝ','ΦΙΛΟΙ']
+    xls = pd.ExcelFile(step3_xlsx_path)
+    with pd.ExcelWriter(out_xlsx_path, engine="openpyxl") as writer:
+        chosen_rows = []
+        for sh in xls.sheet_names:
+            if str(sh).strip().lower().startswith("σύνοψη"):
+                continue
+            df = xls.parse(sh)
+            filled_df = run_step4_multi_with_fill_v2(df, config=config)
+            m = re.search(r"ΒΗΜΑ3_ΣΕΝΑΡΙΟ_(\d+)", str(sh))
+            sid = int(m.group(1)) if m else 1
 
-def _counts_from(df: pd.DataFrame, placed_dict: Dict[Tuple[str, ...], str], 
-                assigned_column: str, classes: List[str]) -> Tuple[Dict[str, int], Dict[str, int], Dict[str, int], Dict[str, int]]:
-    """Υπολογισμός τρεχουσών μετρήσεων συμπεριλαμβανομένων υποθετικών τοποθετήσεων."""
-    cnt = {c: int((df[assigned_column] == c).sum()) for c in classes}
-    good= {c: int(((df[assigned_column] == c) & (df['ΚΑΛΗ_ΓΝΩΣΗ_ΕΛΛΗΝΙΚΩΝ']=='Ν')).sum()) for c in classes}
-    boys= {c: int(((df[assigned_column] == c) & (df['ΦΥΛΟ']=='Α')).sum()) for c in classes}
-    girls={c: int(((df[assigned_column] == c) & (df['ΦΥΛΟ']=='Κ')).sum()) for c in classes}
-    
-    # Εφαρμογή τοποθετημένων ομάδων
-    for g, c in placed_dict.items():
-        size = len(g)
-        sub = df[df['ΟΝΟΜΑ'].isin(g)]
-        cnt[c]   += size
-        good[c]  += int((sub['ΚΑΛΗ_ΓΝΩΣΗ_ΕΛΛΗΝΙΚΩΝ']=='Ν').sum())
-        boys[c]  += int((sub['ΦΥΛΟ']=='Α').sum())
-        girls[c] += int((sub['ΦΥΛΟ']=='Κ').sum())
-    
-    return cnt, good, boys, girls
+            out_df = pd.DataFrame(index=filled_df.index)
+            for c in TARGET_BASE_COLS:
+                out_df[c] = filled_df[c] if c in filled_df.columns else None
+            for step in [1,2,3]:
+                col = f"ΒΗΜΑ{step}_ΣΕΝΑΡΙΟ_{sid}"
+                out_df[col] = filled_df[col] if col in filled_df.columns else None
 
-def accept(cnt: Dict[str, int], good: Dict[str, int], boys: Dict[str, int], girls: Dict[str, int], 
-          cap: int = 25, pop_diff_max: int = 2, good_diff_max: int = 4, gender_diff_max: int = 3) -> bool:
-    """
-    ΔΙΟΡΘΩΜΕΝΟ: gender_diff_max=3 (αυστηρότερο), σωστό max-min για k>2 τμήματα
-    """
-    if any(v > cap for v in cnt.values()): 
-        return False
-    if max(cnt.values()) - min(cnt.values()) > pop_diff_max: 
-        return False
-    if max(good.values()) - min(good.values()) > good_diff_max: 
-        return False
-    if max(boys.values()) - min(boys.values()) > gender_diff_max: 
-        return False
-    if max(girls.values()) - min(girls.values()) > gender_diff_max: 
-        return False
-    return True
-
-def penalty(cnt: Dict[str, int], good: Dict[str, int], boys: Dict[str, int], girls: Dict[str, int], 
-           classes: List[str]) -> int:
-    """Υπολογισμός penalty score βάσει ανισορροπιών (διορθωμένο για k>2)."""
-    penalties = []
-    
-    # Penalty πληθυσμού (πέρα από διαφορά 1)
-    pop_diff = max(cnt.values()) - min(cnt.values())
-    penalties.append(max(0, pop_diff - 1))
-    
-    # Penalty γνώσης ελληνικών (πέρα από διαφορά 2)  
-    good_diff = max(good.values()) - min(good.values())
-    penalties.append(max(0, good_diff - 2))
-    
-    # Penalty φύλου (πέρα από διαφορά 1 για κάθε φύλο)
-    boys_diff = max(boys.values()) - min(boys.values())
-    girls_diff = max(girls.values()) - min(girls.values())
-    penalties.extend([max(0, boys_diff - 1), max(0, girls_diff - 1)])
-    
-    return sum(penalties)
-
-# -------------------- Enhanced Algorithm with IMPROVED Category Strategy --------------------
-
-def apply_step4_with_enhanced_strategy(df: pd.DataFrame, assigned_column: str = 'ΒΗΜΑ3_ΣΕΝΑΡΙΟ_1', 
-                                      num_classes: Optional[int] = None, max_results: int = 5, 
-                                      max_nodes: int = None, exhaustive: bool = False) -> List[Tuple[Dict[Tuple[str, ...], str], int]]:
-    """
-    ΠΛΗΡΩΣ ΔΙΟΡΘΩΜΕΝΗ ΕΚΔΟΣΗ με πραγματική στρατηγική εναλλαγής κατηγοριών.
-    """
-    num_classes = _auto_num_classes(df, num_classes)
-    classes = [f'Α{i+1}' for i in range(num_classes)]
-    
-    # Βασικές μετρήσεις από ήδη τοποθετημένους μαθητές
-    base_cnt = {c: int((df[assigned_column]==c).sum()) for c in classes}
-    base_good= {c: int(((df[assigned_column]==c) & (df['ΚΑΛΗ_ΓΝΩΣΗ_ΕΛΛΗΝΙΚΩΝ']=='Ν')).sum()) for c in classes}
-    base_boys= {c: int(((df[assigned_column]==c) & (df['ΦΥΛΟ']=='Α')).sum()) for c in classes}
-    base_girls={c: int(((df[assigned_column]==c) & (df['ΦΥΛΟ']=='Κ')).sum()) for c in classes}
-
-    # Δημιουργία αμοιβαίων ομάδων φιλίας από μη-τοποθετημένους μαθητές (ΜΟΝΟ ΔΥΑΔΕΣ)
-    groups = create_fully_mutual_groups(df, assigned_column)
-    if not groups:
-        return []
-
-    # Κατηγοριοποίηση ομάδων για στρατηγική
-    categorized_groups = categorize_groups(groups, df)
-    
-    # Καταμέτρηση υπάρχουσων ομάδων ανά κατηγορία ανά τμήμα (από Βήματα 1-3)
-    # ΒΕΛΤΙΩΣΗ: Εντοπισμός διατηρημένων ζευγαριών από προηγούμενα βήματα
-    detected_pairs = []
-    assigned_students = df[~df[assigned_column].isna()]
-    
-    # Εντοπισμός ζευγαριών που ήδη βρίσκονται στο ίδιο τμήμα
-    for class_name in classes:
-        class_students = assigned_students[assigned_students[assigned_column] == class_name]['ΟΝΟΜΑ'].tolist()
-        
-        # Έλεγχος όλων των συνδυασμών για αμοιβαίες φιλίες
-        for i, student1 in enumerate(class_students):
-            for student2 in class_students[i+1:]:
-                if is_fully_mutual([student1, student2], df):
-                    detected_pairs.append((student1, student2))
-    
-    existing_groups_per_class = count_groups_by_category_per_class_strict(
-        df, assigned_column, classes, detected_pairs=detected_pairs
-    )
-    
-    # Υπολογισμός συνολικών ομάδων ανά κατηγορία (υπάρχουσες + νέες)
-    total_groups_per_category = {}
-    for category, group_list in categorized_groups.items():
-        existing_total = sum(existing_groups_per_class[c].get(category, 0) for c in classes)
-        total_groups_per_category[category] = existing_total + len(group_list)
-    
-    # Υπολογισμός ιδανικής διανομής ανά κατηγορία
-    ideal_per_category = calculate_ideal_distribution(total_groups_per_category, classes)
-    
-    print(f"📊 Ιδανική κατανομή ανά κατηγορία: {ideal_per_category}")
-    print(f"📋 Υπάρχουσες ομάδες ανά τμήμα: {dict(existing_groups_per_class)}")
-
-    # Επιπεδοποίηση ομάδων με προτεραιότητα βάσει ανάγκης κατηγοριών
-    def group_priority_with_category_balance(g: List[str]) -> Tuple[int, int, int]:
-        category = get_group_characteristics(g, df)
-        
-        # Υπολογισμός πόσο χρειάζεται αυτή η κατηγορία σε όλα τα τμήματα
-        current_total = sum(existing_groups_per_class[c].get(category, 0) for c in classes)
-        ideal_total = ideal_per_category.get(category, 1)
-        need_score = max(0, ideal_total - current_total)  # Μεγαλύτερο = περισσότερο χρειάζεται
-        
-        sub = df[df['ΟΝΟΜΑ'].isin(g)]
-        boys = int((sub['ΦΥΛΟ']=='Α').sum())
-        girls= int((sub['ΦΥΛΟ']=='Κ').sum())
-        
-        # Προτεραιότητα: need_score desc, size desc, gender balance desc
-        return (-need_score, -len(g), -abs(boys-girls))
-    
-    all_groups = []
-    for group_list in categorized_groups.values():
-        all_groups.extend(group_list)
-    
-    groups = sorted(all_groups, key=group_priority_with_category_balance)
-
-    results = []
-    nodes = 0
-    placed = {}
-    
-    # Παρακολούθηση τελευταίας τοποθετημένης κατηγορίας ανά τμήμα για εναλλαγή
-    last_category_per_class = {c: None for c in classes}
-
-    def get_preferred_class_for_group(group: List[str], cnt: Dict[str, int], 
-                                     good: Dict[str, int], boys: Dict[str, int], girls: Dict[str, int]) -> List[str]:
-        """
-        ΒΕΛΤΙΩΜΕΝΗ στρατηγική: Καθορισμός προτιμώμενης σειράς τμημάτων βάσει:
-        1. ideal_per_class διανομής ανά κατηγορία (ΝΕΟ!)
-        2. Στρατηγικής εναλλαγής κατηγοριών
-        3. Load balancing
-        """
-        category = get_group_characteristics(group, df)
-        
-        # Έναρξη με load balancing
-        order = sorted(classes, key=lambda c: (cnt[c], good[c], boys[c]+girls[c]))
-        
-        # ΒΕΛΤΙΩΣΗ 1: Εφαρμογή ideal_per_class στην τοποθέτηση
-        ideal_preferred = []
-        alternation_preferred = []
-        other_classes = []
-        
-        opposite_category = get_opposite_category(category)
-        ideal_for_category = ideal_per_category.get(category, 1)
-        
-        for c in order:
-            current_groups_in_category = existing_groups_per_class[c].get(category, 0)
-            
-            # Προσθέτουμε τις ήδη τοποθετημένες ομάδες αυτής της κατηγορίας σε αυτό το placement
-            groups_placed_here = sum(1 for placed_group, placed_class in placed.items() 
-                                   if placed_class == c and 
-                                   get_group_characteristics(list(placed_group), df) == category)
-            
-            current_total = current_groups_in_category + groups_placed_here
-            
-            # ΠΡΟΤΕΡΑΙΟΤΗΤΑ 1: Τμήματα που υπολείπονται από τον ιδανικό αριθμό
-            if current_total < ideal_for_category:
-                ideal_preferred.append(c)
-            # ΠΡΟΤΕΡΑΙΟΤΗΤΑ 2: Εναλλαγή κατηγοριών (αν δεν υπολείπεται ιδανικός)
-            # ΔΙΟΡΘΩΣΗ: Μόνο όταν υπάρχει και ταιριάζει η ακριβώς αντίθετη κατηγορία
-            elif opposite_category is not None and last_category_per_class[c] == opposite_category:
-                alternation_preferred.append(c)
+            best_k, best_col = _pick_best_step4_col(filled_df)
+            if best_col is not None:
+                out_df[f"ΒΗΜΑ4_ΣΕΝΑΡΙΟ_{sid}"] = filled_df[best_col]
+                pen = None
+                if best_k is not None and f"ΒΗΜΑ4_penalty_{best_k}" in filled_df.columns:
+                    pser = filled_df[f"ΒΗΜΑ4_penalty_{best_k}"].dropna()
+                    pen = float(pser.iloc[0]) if not pser.empty else None
+                chosen_rows.append({"Sheet": f"ΣΕΝΑΡΙΟ_{sid}", "Best": best_col, "Penalty": pen})
             else:
-                other_classes.append(c)
-        
-        # Επιστροφή με σειρά προτεραιότητας: ideal → alternation → load balancing
-        final_order = ideal_preferred + alternation_preferred + other_classes
-        
-        # DEBUG: Εκτύπωση στρατηγικής για debugging
-        if len(final_order) > 0:
-            print(f"🎯 Ομάδα {group} ({category}) → Προτιμώμενη σειρά: {final_order[:3]}")
-        
-        return final_order
+                out_df[f"ΒΗΜΑ4_ΣΕΝΑΡΙΟ_{sid}"] = None
+                chosen_rows.append({"Sheet": f"ΣΕΝΑΡΙΟ_{sid}", "Best": "(none)", "Penalty": None})
 
-    def dfs(idx: int, cnt: Dict[str, int], good: Dict[str, int], 
-            boys: Dict[str, int], girls: Dict[str, int]) -> None:
-        nonlocal nodes
-        nodes += 1
-        
-        # Έλεγχος ορίων μόνο αν δεν είναι exhaustive mode
-        if not exhaustive and max_nodes and nodes > max_nodes:
-            return
-        
-        # Γρήγορος έλεγχος χωρητικότητας
-        if any(v > 25 for v in cnt.values()):
-            return
+            ordered = TARGET_BASE_COLS + [f"ΒΗΜΑ1_ΣΕΝΑΡΙΟ_{sid}", f"ΒΗΜΑ2_ΣΕΝΑΡΙΟ_{sid}", f"ΒΗΜΑ3_ΣΕΝΑΡΙΟ_{sid}", f"ΒΗΜΑ4_ΣΕΝΑΡΙΟ_{sid}"]
+            out_df = out_df[ordered]
+            out_df.to_excel(writer, index=False, sheet_name=f"ΣΕΝΑΡΙΟ_{sid}")
 
-        # Base case: όλες οι ομάδες επεξεργάστηκαν
-        if idx == len(groups):
-            if accept(cnt, good, boys, girls):
-                p = penalty(cnt, good, boys, girls, classes)
-                results.append((deepcopy(placed), p))
-            return
-
-        # Τρέχουσα ομάδα προς τοποθέτηση
-        g = groups[idx]
-        category = get_group_characteristics(g, df)
-        sub = df[df['ΟΝΟΜΑ'].isin(g)]
-        gsize = len(g)
-        ggood = int((sub['ΚΑΛΗ_ΓΝΩΣΗ_ΕΛΛΗΝΙΚΩΝ']=='Ν').sum())
-        gboys = int((sub['ΦΥΛΟ']=='Α').sum())
-        ggirls= int((sub['ΦΥΛΟ']=='Κ').sum())
-
-        # Λήψη προτιμώμενης σειράς τμημάτων χρησιμοποιώντας στρατηγική κατηγοριών
-        preferred_order = get_preferred_class_for_group(g, cnt, good, boys, girls)
-
-        for c in preferred_order:
-            # Προσομοίωση τοποθέτησης
-            cnt[c]   += gsize
-            good[c]  += ggood
-            boys[c]  += gboys
-            girls[c] += ggirls
-            placed[tuple(g)] = c
-            
-            # Ενημέρωση παρακολούθησης εναλλαγής
-            old_category = last_category_per_class[c]
-            last_category_per_class[c] = category
-
-            # Pruning μόνο αν δεν είναι exhaustive mode
-            if exhaustive or (max(cnt.values()) - min(cnt.values())) <= 2:
-                dfs(idx+1, cnt, good, boys, girls)
-
-            # Backtrack
-            last_category_per_class[c] = old_category
-            placed.pop(tuple(g), None)
-            cnt[c]   -= gsize
-            good[c]  -= ggood
-            boys[c]  -= gboys
-            girls[c] -= ggirls
-
-            # Early termination μόνο αν δεν είναι exhaustive mode
-            if not exhaustive and len(results) >= max_results:
-                return
-
-    # Έναρξη DFS
-    dfs(0, base_cnt.copy(), base_good.copy(), base_boys.copy(), base_girls.copy())
-
-    # Ταξινόμηση βάσει penalty score (καλύτερα πρώτα)
-    results_sorted = sorted(results, key=lambda t: t[1])[:max_results]
-    return results_sorted
-
-def export_step4_scenarios(df: pd.DataFrame, results: List[Tuple[Dict[Tuple[str, ...], str], int]], 
-                          assigned_column: str = 'ΒΗΜΑ3_ΣΕΝΑΡΙΟ_1') -> pd.DataFrame:
-    """
-    Export έως 5 σεναρίων ως νέες στήλες ΒΗΜΑ4_ΣΕΝΑΡΙΟ_1 έως 5.
-    """
-    df_result = df.copy()
-    
-    for i, (placed_dict, penalty_score) in enumerate(results[:5], 1):
-        col_name = f'ΒΗΜΑ4_ΣΕΝΑΡΙΟ_{i}'
-        
-        # Έναρξη με υπάρχουσες τοποθετήσεις
-        df_result[col_name] = df_result[assigned_column].copy()
-        
-        # Εφαρμογή νέων τοποθετήσεων
-        for group_tuple, class_name in placed_dict.items():
-            group_names = list(group_tuple)
-            mask = df_result['ΟΝΟΜΑ'].isin(group_names)
-            df_result.loc[mask, col_name] = class_name
-        
-        print(f"Σενάριο {i}: Penalty Score = {penalty_score}")
-    
-    return df_result
-
-# -------------------- Main execution function --------------------
-
-def run_step4_complete(df: pd.DataFrame, assigned_column: str = 'ΒΗΜΑ3_ΣΕΝΑΡΙΟ_1', 
-                      num_classes: Optional[int] = None) -> pd.DataFrame:
-    """
-    Πλήρης εκτέλεση Βήμα 4 με στρατηγική εναλλαγής κατηγοριών και ιδανική διανομή.
-    """
-    print("🔍 Εκτέλεση Βήμα 4: Αμοιβαίες Φιλίες με Στρατηγική Εναλλαγής")
-    print("="*65)
-    
-    # Έλεγχος αν υπάρχει στήλη ΣΠΑΣΜΕΝΕΣ_ΦΙΛΙΕΣ
-    if 'ΣΠΑΣΜΕΝΕΣ_ΦΙΛΙΕΣ' not in df.columns:
-        print("⚠️  Προσθήκη στήλης ΣΠΑΣΜΕΝΕΣ_ΦΙΛΙΕΣ (default: False)")
-        df = df.copy()
-        df['ΣΠΑΣΜΕΝΕΣ_ΦΙΛΙΕΣ'] = False
-    
-    # Εύρεση σεναρίων χρησιμοποιώντας βελτιωμένη στρατηγική
-    results = apply_step4_with_enhanced_strategy(df, assigned_column, num_classes)
-    
-    if not results:
-        print("❌ Δεν βρέθηκαν έγκυρα σενάρια τοποθέτησης.")
-        return df
-    
-    print(f"✅ Βρέθηκαν {len(results)} σενάρια:")
-    
-    # Export σεναρίων σε DataFrame
-    df_with_scenarios = export_step4_scenarios(df, results, assigned_column)
-    
-    # Εμφάνιση περίληψης
-    for i, (_, penalty) in enumerate(results[:5], 1):
-        col_name = f'ΒΗΜΑ4_ΣΕΝΑΡΙΟ_{i}'
-        assigned_count = (~df_with_scenarios[col_name].isna()).sum()
-        unassigned_count = df_with_scenarios[col_name].isna().sum()
-        
-        print(f"  Σενάριο {i}: Ποινή={penalty}, Τοποθετημένοι={assigned_count}, Μη-τοποθετημένοι={unassigned_count}")
-    
-    return df_with_scenarios
-
-# -------------------- Testing function --------------------
-
-if __name__ == "__main__":
-    print("Step 4 ΠΛΗΡΩΣ ΔΙΟΡΘΩΜΕΝΟ Module - Έτοιμο για import")
-    print("Χρήση: from step4_fully_corrected import run_step4_complete")
-    print("       df_result = run_step4_complete(df, 'ΒΗΜΑ3_ΣΕΝΑΡΙΟ_1')")
+        summ = pd.DataFrame(chosen_rows)
+        summ.to_excel(writer, index=False, sheet_name="Σύνοψη_Επιλογών")
+        meta = pd.DataFrame([{
+            "generated_at": datetime.now().isoformat(timespec="seconds"),
+            "config": repr(config)
+        }])
+        meta.to_excel(writer, index=False, sheet_name="Meta")
+    return out_xlsx_path
