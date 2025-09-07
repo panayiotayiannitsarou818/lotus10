@@ -58,6 +58,19 @@ class Step4Config:
     # NEW: ideal strategy flags
     use_ideal_strategy: bool = True
     prefer_opposites: bool = True
+    max_greek_diff: int = 6
+    max_gender_diff: int = 6
+    cap_per_class: int = 25
+    max_scenarios: int = 5
+    # weights for heuristic class scoring (lower is better)
+    w_pop_variance: float = 1.0
+    w_greek_variance: float = 0.6
+    w_gender_variance: float = 0.6
+    w_cap_overflow: float = 100.0   # hard discourage breaking cap
+    random_seed: int = 42
+    # NEW: ideal strategy flags
+    use_ideal_strategy: bool = True
+    prefer_opposites: bool = True
 
 STEP_COLUMN_PATTERNS = re.compile(r"^ΒΗΜΑ[1-3]_ΣΕΝΑΡΙΟ_\d+$")
 FRIEND_COLUMN_CANDIDATES = ("ΦΙΛΟΙ","ΦΙΛΟΣ")
@@ -405,6 +418,86 @@ def generate_scenarios_for_dyads_v2(df: pd.DataFrame,
     solutions.sort(key=lambda s: (s["penalty"],) + diffs_tuple(s["metrics"]))
     return solutions[:cfg.max_scenarios]
 
+
+
+def generate_scenarios_for_dyads_ideal(df, dyads, base_assign, classes, cfg):
+    # Fallback minimal ideal strategy: equalize category counts per class with alternation.
+    K = len(classes)
+    mets = _init_metrics_from_base(df, base_assign, classes)
+    # Build category counts and dyads per category
+    info = []
+    cat_counts = {}
+    for (i,j) in dyads:
+        rows = [df.loc[i], df.loc[j]]
+        cat = group_category(rows)  # uses gender_cat/greek_cat
+        key = (cat["gender_cat"], cat["greek_cat"])
+        cat_counts[key] = cat_counts.get(key, 0) + 1
+        info.append({"pair": (i,j), "key": key})
+    # Ideal per category (students)
+    per_class_cat = {key: {cl:0 for cl in classes} for key in cat_counts.keys()}
+    ideals = {key: round((sum(per_class_cat[key].values()) + 2*sum(1 for x in info if x["key"]==key))/max(1,K)) for key in cat_counts.keys()}
+
+    # Order by scarcity
+    info.sort(key=lambda x: -1.0/cat_counts[x["key"]])
+
+    last_key = {cl: None for cl in classes}
+    sols = []
+    assign = {}
+    def backtrack(pos):
+        if len(sols) >= cfg.max_scenarios: return
+        if pos >= len(info):
+            if not ranges_ok(mets, cfg): return
+            pen = penalty_score(mets)
+            ser = pd.Series(index=df.index, dtype=object)
+            for sid, cl in assign.items(): ser.loc[sid] = cl
+            sols.append({"assign": ser, "metrics": {c: m.copy() for c,m in mets.items()}, "penalty": pen})
+            return
+        item = info[pos]
+        pair, key = item["pair"], item["key"]
+        cands = []
+        for cl in classes:
+            # cap check
+            if _would_break_cap(mets, cl, 2, cfg): 
+                continue
+            # score by gap to ideal + alternation bonus
+            gap = abs((per_class_cat[key][cl] + 2) - ideals[key])
+            alt_bonus = -0.5 if (cfg.prefer_opposites and last_key[cl] is not None and last_key[cl] != key) else 0.0
+            # simulate quick range ok
+            _place_pair(df, pair, cl, mets)
+            ok = ranges_ok(mets, cfg)
+            # revert
+            for sid in pair:
+                row = df.loc[sid]; m = mets[cl]
+                m["total"] -= 1
+                g = _gender_norm(row.get("ΦΥΛΟ",""))
+                if g == "ΑΓΟΡΙ": m["boys"] -= 1
+                elif g == "ΚΟΡΙΤΣΙ": m["girls"] -= 1
+                if _greek_norm(row.get("ΚΑΛΗ_ΓΝΩΣΗ_ΕΛΛΗΝΙΚΩΝ","")) == "Ν": m["greek_good"] -= 1
+            if ok:
+                cands.append(((gap + alt_bonus), cl))
+        if not cands:
+            return
+        cands.sort(key=lambda x: x[0])
+        best = [cl for sc,cl in cands if sc == cands[0][0]]
+        for cl in best[:max(2, cfg.max_scenarios - len(sols))]:
+            assign[pair[0]] = cl; assign[pair[1]] = cl
+            _place_pair(df, pair, cl, mets)
+            per_class_cat[key][cl] += 2
+            prev = last_key[cl]; last_key[cl] = key
+            backtrack(pos+1)
+            last_key[cl] = prev
+            per_class_cat[key][cl] -= 2
+            for sid in pair:
+                del assign[sid]
+                row = df.loc[sid]; m = mets[cl]
+                m["total"] -= 1
+                g = _gender_norm(row.get("ΦΥΛΟ",""))
+                if g == "ΑΓΟΡΙ": m["boys"] -= 1
+                elif g == "ΚΟΡΙΤΣΙ": m["girls"] -= 1
+                if _greek_norm(row.get("ΚΑΛΗ_ΓΝΩΣΗ_ΕΛΛΗΝΙΚΩΝ","")) == "Ν": m["greek_good"] -= 1
+    backtrack(0)
+    sols.sort(key=lambda s: (s["penalty"],) + metrics_diff_tuple(s["metrics"]))
+    return sols[:cfg.max_scenarios]
 # ------------------------- Public APIs --------------------------------------
 
 def run_step4_multi_with_fill_v2(df: pd.DataFrame, config: Step4Config = Step4Config()) -> pd.DataFrame:
@@ -432,7 +525,9 @@ def run_step4_multi_with_fill_v2(df: pd.DataFrame, config: Step4Config = Step4Co
         out["Σύνοψη_ΒΗΜΑ4"] = "Δεν βρέθηκαν πλήρως αμοιβαίες δυάδες μεταξύ μη-τοποθετημένων."
         return out
 
-    sols = generate_scenarios_for_dyads_v2(df, dyads, base_assign, classes, config)
+    sols = (generate_scenarios_for_dyads_ideal(df, dyads, base_assign, classes, config)
+        if getattr(config, 'use_ideal_strategy', True) else
+        generate_scenarios_for_dyads_v2(df, dyads, base_assign, classes, config))
     if not sols:
         out["Σύνοψη_ΒΗΜΑ4"] = "Δεν βρέθηκαν αποδεκτά σενάρια με βάση τα όρια."
         return out
@@ -560,4 +655,66 @@ def export_step3_to_per_scenario_exact_filled_v2(step3_xlsx_path: str, out_xlsx_
             "config": repr(config)
         }])
         meta.to_excel(writer, index=False, sheet_name="Meta")
+    return out_xlsx_path
+
+# --- Compatibility shim for external callers ---
+import pandas as pd
+from typing import Optional
+
+def apply_step4_with_enhanced_strategy(
+    df: pd.DataFrame,
+    assigned_column: str = 'ΒΗΜΑ3_ΣΕΝΑΡΙΟ_1',
+    num_classes: Optional[int] = None,
+    max_results: int = 5,
+    **kwargs
+):
+    """
+    Return DataFrame with ΒΗΜΑ4_ΣΕΝΑΡΙΟ_1..max_results filled.
+    - If no mutual dyads exist, all ΒΗΜΑ4_ΣΕΝΑΡΙΟ_k are carry-forward of prior steps (Βήμα3→2→1).
+    - Honors hard constraints and produces up to `max_results` candidate Step4 columns.
+    """
+    cfg = Step4Config(max_scenarios=int(max_results), use_ideal_strategy=True, prefer_opposites=True)
+    return run_step4_multi_with_fill_v2(df, config=cfg)
+
+
+def export_step3_to_per_scenario_exact_like_template(step3_xlsx_path: str, out_xlsx_path: str, config: Step4Config = Step4Config()) -> str:
+    """
+    Export EXACTLY like the provided template:
+    - Only sheets named 'ΣΕΝΑΡΙΟ_{k}'.
+    - Columns (in order): 8 base + ΒΗΜΑ1_ΣΕΝΑΡΙΟ_k, ΒΗΜΑ2_ΣΕΝΑΡΙΟ_k, ΒΗΜΑ3_ΣΕΝΑΡΙΟ_k, ΒΗΜΑ4_ΣΕΝΑΡΙΟ_k
+    - No 'Σύνοψη' / No 'Meta' sheets.
+    """
+    TARGET_BASE_COLS = ['Α/Α','ΟΝΟΜΑ','ΦΥΛΟ','ΖΩΗΡΟΣ','ΙΔΙΑΙΤΕΡΟΤΗΤΑ','ΠΑΙΔΙ_ΕΚΠΑΙΔΕΥΤΙΚΟΥ','ΚΑΛΗ_ΓΝΩΣΗ_ΕΛΛΗΝΙΚΩΝ','ΦΙΛΟΙ']
+    xls = pd.ExcelFile(step3_xlsx_path)
+    with pd.ExcelWriter(out_xlsx_path, engine="openpyxl") as writer:
+        for sh in xls.sheet_names:
+            if str(sh).strip().lower().startswith("σύνοψη"):
+                continue
+            df = xls.parse(sh)
+            filled_df = run_step4_multi_with_fill_v2(df, config=config)
+            m = re.search(r"ΒΗΜΑ3_ΣΕΝΑΡΙΟ_(\d+)", str(sh))
+            sid = int(m.group(1)) if m else 1
+
+            out_df = pd.DataFrame(index=filled_df.index)
+            # base
+            for c in TARGET_BASE_COLS:
+                out_df[c] = filled_df[c] if c in filled_df.columns else None
+
+            # step columns
+            step_cols = [f"ΒΗΜΑ1_ΣΕΝΑΡΙΟ_{sid}", f"ΒΗΜΑ2_ΣΕΝΑΡΙΟ_{sid}", f"ΒΗΜΑ3_ΣΕΝΑΡΙΟ_{sid}"]
+            for c in step_cols:
+                out_df[c] = filled_df[c] if c in filled_df.columns else None
+
+            # pick best ΒΗΜΑ4 and keep only that one
+            k_best, best_col = _pick_best_step4_col(filled_df)
+            if best_col is not None and best_col in filled_df.columns:
+                out_df[f"ΒΗΜΑ4_ΣΕΝΑΡΙΟ_{sid}"] = filled_df[best_col]
+            else:
+                # carry-forward if none
+                base_assign = _base_assignment_series(filled_df)
+                out_df[f"ΒΗΜΑ4_ΣΕΝΑΡΙΟ_{sid}"] = base_assign
+
+            ordered = TARGET_BASE_COLS + step_cols + [f"ΒΗΜΑ4_ΣΕΝΑΡΙΟ_{sid}"]
+            out_df = out_df[ordered]
+            out_df.to_excel(writer, index=False, sheet_name=f"ΣΕΝΑΡΙΟ_{sid}")
     return out_xlsx_path
